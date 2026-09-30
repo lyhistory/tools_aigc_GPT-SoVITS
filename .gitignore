@@ -1,0 +1,48 @@
+# ============================================================
+# 这个仓库只放脚本和 notebook，下面这些大文件 / 别人仓库都不提交
+# ============================================================
+
+# ---- 官方仓库 / 整合包本体：本机自己下 ----
+# 坑：git 遇到嵌套的 .git 目录时只会记一个 commit 指针（gitlink），
+#     别人的源码一个字节都不会进你的仓库，别人 clone 只会得到空目录。
+/GPT-SoVITS/
+/GPT-SoVITS-*/
+/GPT-SoVITS-v2pro*/
+/GPT-SoVITS-v4*/
+*.7z
+*.zip
+
+# ---- 整合包自带、好几 GB 的运行时 ----
+runtime/
+ffmpeg*
+ffprobe*
+
+# ---- 训练 / 推理产物：体积大，而且随时能重新生成 ----
+output/
+logs/
+TEMP/
+tts_out/
+*.ckpt
+*.pth
+*.safetensors
+
+# ---- 权重目录：模型文件走网盘，不要进 Git ----
+GPT_weights*/
+SoVITS_weights*/
+
+# ---- 参考音频 / 训练素材：涉及本人声音，别公开 ----
+ref/
+ref_audios/
+slices/
+*.wav
+*.mp3
+*.flac
+*.m4a
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+env/
+
