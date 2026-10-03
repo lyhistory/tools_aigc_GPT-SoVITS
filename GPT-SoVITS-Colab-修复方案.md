@@ -530,3 +530,41 @@ pwsh -File install.ps1 -Device CPU -Source HF-Mirror
    直接 `return cpu, torch.float32`，`is_half = any(dtype == torch.float16 ...)`。
    纯 CPU 机器**什么都不用改**；只有「有显卡但想强制 CPU」才设 `CUDA_VISIBLE_DEVICES=""`。
 5. 速度：CPU 约比显卡慢一个数量级，一句 10 秒的话几十秒是正常的；内存建议 ≥8GB。
+
+6. **`change_sovits_weights()` 在命令行调用时会 `UnboundLocalError`（官方 bug，实测撞到）**
+
+   ```
+   File "GPT_SoVITS/inference_webui.py", line 380, in change_sovits_weights
+       prompt_text_update,
+   UnboundLocalError: local variable 'prompt_text_update' referenced before assignment
+   ```
+
+   两个原因叠在一起：
+
+   - 它是**生成器**（函数体里有 `yield`），所以不迭代就等于**完全没加载权重** ——
+     这就是官方自带的 `GPT_SoVITS/inference_cli.py` 为什么是坏的，它调用时没迭代。
+   - 它末尾那个 `yield` 引用了 `prompt_text_update` / `prompt_language_update` /
+     `text_update` / `text_language_update` / `visible_sample_steps` / `visible_inp_refs`，
+     而这些变量**只在**下面这个分支里赋值：
+
+     ```python
+     if prompt_language is not None and text_language is not None:
+     ```
+
+   WebUI 调用时永远会带这两个语种，所以官方自己永远踩不到；命令行调用不传就炸。
+   GitHub 主分支（`main`）和 `v2pro-20250604` 整合包两份代码都有这个问题。
+
+   正确调法是照 WebUI 的调法把两个语种一起传进去（`lang_key()` 返回的就是
+   `dict_language` 的 key，正好是它期望的 i18n 字符串）：
+
+   ```python
+   for _ in change_sovits_weights(SOV_W, lang_key(PROMPT_CODE), lang_key(TEXT_CODE)):
+       pass
+   ```
+
+   顺带一提，同一个函数还有第二个坑：`get_tts_wav()` 的 `how_to_cut` 参数默认值是
+   i18n("不切")，也就是**整段文本当成一句**合成，长文案容易重复、漏字、变调。
+   命令行场景应该显式给 `how_to_cut=iw.i18n("按标点符号切")`。
+
+   实测（整合包 + v2Pro 权重，纯 CPU）：加载模型约 30 秒，合成一句 3.5 秒的话约 23 秒，
+   产物是 32 kHz 单声道 wav。

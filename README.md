@@ -6,6 +6,8 @@
 | --- | --- |
 | `GPT-SoVITS-T4.ipynb` | 主流程。从切片一路跑到出权重，每格都带自检和明确的错误提示 |
 | `gsv_tts_local.py` | 本机命令行推理脚本，不启动 WebUI |
+| `gsv_tts.ini` | 默认参数。填一次，以后只给文本就能合成 |
+| `合成.bat` | 双击 / 拖 txt 上去就能合成，不用开终端 |
 | `GPT-SoVITS-Colab-修复方案.md` | notebook 里每一处修复对应的官方 bug 和源码位置，出问题时看 |
 | `RVC_Boss_GPT_SoVITS_Colab_Inference-not work.ipynb` | 官方原版 notebook，留档对照 |
 
@@ -78,7 +80,8 @@ curl.exe -L -C - -o GPT-SoVITS-v2pro-20250604.7z "https://hf-mirror.com/lj1995/G
 
 ### 2.3 放脚本和权重
 
-1. 把 `gsv_tts_local.py` 复制进整合包根目录
+1. 把 `gsv_tts_local.py`、`gsv_tts.ini`、`合成.bat` 三个文件复制进整合包根目录
+   （就是有 `webui.py` 的那层），再建一个 `ref\` 目录放参考音频
 2. 权重放好：
 
 ```
@@ -89,20 +92,77 @@ curl.exe -L -C - -o GPT-SoVITS-v2pro-20250604.7z "https://hf-mirror.com/lj1995/G
 
 不给 `--gpt` / `--sovits` 时，脚本会自动挑这两个目录里**最新**的文件。
 
-### 2.4 准备参考音频
+### 2.4 参考音频（音色样本）
 
-推理只需要**一段** 3~10 秒的干净人声（5~7 秒最稳）：
+推理要额外给**一段**参考音频，它就是"音色样本"。三个参数的分工：
 
+| 参数 | 是什么 |
+| --- | --- |
+| `--ref` | 你额外准备的**一段** 3~10 秒干净人声（和训练数据没关系也行） |
+| `--ref-text` | **这段音频里原封不动说的话**（不是你要合成的内容） |
+| `--text` | **你要合成的内容** |
+
+`--ref` 的要求：
+
+- **3~10 秒，5~7 秒最稳。** 太短音色学不准；太长容易跑偏、变调，也慢
 - 只有你一个人的声音，中间没插进别人的话
 - 无 BGM、无混响、无电流声
 - 不要剪在半句话中间
-- wav / mp3 / flac 都行
+- wav / mp3 / flac 都行，采样率随便
 
-原文 `--ref-text` 必须和这段音频**逐字一致**（含标点、数字怎么读的），写错会明显跑调或者念糊。
-手上有 `output.list` 的话，用 `--list` 让脚本按文件名自动查。
+`--ref-text` 必须和这段音频**逐字一致**（含标点、数字怎么读的），写错会明显跑调或者念糊。
+
+#### 为什么有了权重还要参考音频？
+
+因为它俩分工不同：**权重学的是"这个人的发音习惯和音色倾向"，参考音频是每次合成时喂进去的
+"样板"**，模型照着这段样板决定这一次的音色。所以：
+
+- 权重负责"像不像你"，参考音频负责"这一次以哪个状态为准"
+- **参考音频准备一次就够了，以后一直用同一段**，不用每次都换
+- 换一段不同语速/情绪的参考音频，出来会略有差异 —— 这是它比传统 TTS 灵活的地方
 
 > 不需要 `logs\...\5-wav32k\`。那是训练中间产物，推理一行都不碰。
 
+#### 语种
+
+`--ref-lang` 是参考音频的语种，`--lang` 是要合成文本的语种，都默认 `zh`。
+支持：`zh` 中文 / `en` 英文 / `ja` 日文 / `yue` 粤语 / `ko` 韩文 /
+`zh-en` 中英混合 / `ja-en` 日英混合 / `multi` 自动识别语种。
+
+两者**可以不一样** —— 用中文参考音频念英文句子是可以的，只是会带一点中文口音。
+但 `--ref-lang` 必须和参考音频的**真实**语种一致，不一致会念飞。
+
+#### 文本长度
+
+没有硬上限，但**一段太长一定出问题**（重复字、漏字、突然变调）。
+脚本默认 `--cut punct`，会按标点自动切句、合成完再拼起来，所以整段丢进去也行。
+如果文本里几乎没有标点，用 `--cut 50字` 强制按 50 字左右断开。
+
+#### `--list` 到底做什么
+
+它**只提供「文件名 → 原文」的映射，不提供音频**。
+脚本读 `output.list` 时只取文件名那一段，前面的绝对路径直接丢掉，
+所以 `/content/drive/MyDrive/...` 这种路径它**不会**去访问，本地也找不到。
+
+因此 `--ref-dir` + `--list` 的用法是：
+
+- 你先把**切片 wav 文件**放到本地某个目录（`--ref-dir`）
+- 脚本从那个目录里挑一段 3~10 秒的
+- 再用它的文件名去 `output.list` 里查出原文，自动当 `--ref-text`
+
+好消息：你之前那张 `output.list` 里写的是
+`/content/drive/MyDrive/Colab/output/...`，说明**切片是写在 Google Drive 上的**，
+大概率还在。用 Google Drive 桌面版同步下来，或网页端把 `MyDrive\Colab\output` 整个下载下来，
+就能直接复用：
+
+```powershell
+.\runtime\python.exe gsv_tts_local.py --root . --version v2Pro `
+  --ref-dir "G:\My Drive\Colab\output" `
+  --list "G:\My Drive\Colab\output\output.list" `
+  --text "今天天气不错，我们一起出去走走吧。"
+```
+
+懒得找也没关系，自己剪一段 5~7 秒的 + 手写 `--ref-text` 效果完全一样。
 ### 2.5 跑
 
 ```powershell
@@ -119,13 +179,65 @@ cd <整合包根>
 CPU 上第一次加载要读 BERT + hubert + 两个权重，等 20~60 秒是正常的；
 之后每合成一句 10 秒的话还要再花 20~60 秒。慢是正常的，不是卡死。
 
-### 2.6 常用参数
+### 2.6 配置一次，以后只给文本
+
+把 `gsv_tts.ini` 里的 `root` / `version` / `ref` / `ref-text` 填好之后，日常合成只需要给文本。
+**命令行上写的参数永远覆盖 ini**，所以临时想换参考音频直接加 `--ref` 就行。
+
+三种日常用法：
+
+**A. 一整段文案 —— 一行一句存成 txt，一次合成**
+
+```powershell
+.\runtime\python.exe gsv_tts_local.py --text-file 文案.txt
+```
+
+`文案.txt` 用 UTF-8 保存（记事本的"UTF-8"选项），一行一句。
+长文案建议一行 10~50 字、按自然停顿断句，不要一整段塞一行。
+
+**合成前脚本会打印「待合成 N 句」和前 3 句的内容**，扫一眼就能确认喂进去的是对的文本。
+
+产物取决于 `merge`：
+
+- `merge = true`（ini 里默认）：全部合完拼成**一个** `tts_out\merged_xxx.wav`，段间留 0.25 秒静音
+- `merge = false`：每句一个 `001_xxx.wav` / `002_xxx.wav`，方便挑出哪句念坏了
+
+**B. 双击 `合成.bat` —— 直接合成剪贴板里的文字**
+
+最快的路径：复制文案 → 双击 `合成.bat` → 出音频。双击时不带参数，会自动读 Windows 剪贴板，
+一个换行算一句。
+
+> ⚠️ 双击时读的是**剪贴板当前内容**。如果你刚复制的是日志、代码或别的东西，它就会念那个。
+> 合成前先看脚本打印的「待合成 N 句」确认一下。
+
+**C. 把 txt 拖到 `合成.bat` 上**
+
+等价于 A，不用开终端。
+
+也可以直接给一句话，或者读剪贴板：
+
+```powershell
+.\runtime\python.exe gsv_tts_local.py --text "今天天气不错"
+.\runtime\python.exe gsv_tts_local.py --clip
+```
+
+想换某一轮权重，命令行覆盖即可，ini 不用改：
+
+```powershell
+.\runtime\python.exe gsv_tts_local.py --text-file 文案.txt `
+  --gpt ".\GPT_weights_v2Pro\voice_liuyue-e10.ckpt"
+```
+
+### 2.7 常用参数
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `--gpt` / `--sovits` | 自动挑最新 | 指定某一轮权重 |
 | `--ref-dir` + `--list` | — | 给切片目录 + `output.list`，参考音频和原文全自动 |
 | `--text-file` | — | 批量合成，一行一句（UTF-8） |
+| `--ref-lang` / `--lang` | zh / zh | 参考音频语种 / 合成文本语种 |
+| `--cut` | punct | 长文本切句：punct / 50字 / 4句 / 中文句号 / 英文句号 / none |
+| `--merge` | 见 ini | 把所有句子拼成一个 wav（ini 里默认 `merge = true`） |
 | `--temperature` | 1.0 | 越大越随机。念得太平→1.1~1.2；重复漏字→0.8~0.9 |
 | `--top-k` | 15 | 调大到 20~30 通常更稳 |
 | `--seed` | -1 | 固定随机种子，方便对比参数改动 |
@@ -156,6 +268,11 @@ CPU 上第一次加载要读 BERT + hubert + 两个权重，等 20~60 秒是正�
 | 报缺 ffmpeg | 整合包自带，正常不会遇到 | 确认没把整合包目录拆散 |
 | 第一次跑卡很久 | CPU 加载模型慢 | 等，别 Ctrl+C |
 | 有显卡但想强制走 CPU | — | 加 `--cpu`，**不要去改 `config.py`** |
+| 生成出一堆 wav 而不是一个 | 文本是多行，且 `merge = false` | ini 里改成 `merge = true`，或加 `--merge` |
+| 合成出来的内容完全不是想要的文案 | `--clip` 读到的是剪贴板里别的东西（比如刚复制的日志） | 看合成前的「待合成」预览，重新复制正确的文案 |
+| 双击 `合成.bat` 一闪而过 | 没放在整合包根目录 | 和 `gsv_tts_local.py` 放在同一层，也就是有 `webui.py` 的那层 |
+| `--clip` 报读不到剪贴板 | 剪贴板是空的，或系统里没有 powershell | 先复制一段文字；或改用 `--text-file` |
+| 改了 `gsv_tts.ini` 没生效 | 命令行上写了同一个参数（命令行优先） | 把命令行上那个参数去掉 |
 
 > 网上流传的「打开 `config.py`，把 `device = "cuda"` 改成 `"cpu"`、`is_half = True` 改成 `False`」
 > 是**旧版**攻略。当前版本 `config.py` 里**没有这两行**了，改成自动判断：
@@ -210,3 +327,6 @@ pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torcha
 ```
 
 之后同样用 `python gsv_tts_local.py --root . --version v2Pro ...`。
+
+
+

@@ -66,6 +66,18 @@ LANG_ALIAS = {
     "multi": "auto", "多语种混合": "auto",
 }
 
+# 长文本切句方式。官方 get_tts_wav 的 how_to_cut 参数默认是「不切」，
+# 也就是整段当成一句去合成 —— 段落一长就容易重复、漏字、变调。
+# 这里默认改成「按标点符号切」，并按官方 i18n 的键取值（必须走 iw.i18n() 才能和内部比较对上）。
+CUT_ALIAS = {
+    "punct": "按标点符号切", "标点": "按标点符号切", "按标点符号切": "按标点符号切",
+    "50": "凑50字一切", "50字": "凑50字一切", "凑50字一切": "凑50字一切",
+    "4": "凑四句一切", "4句": "凑四句一切", "凑四句一切": "凑四句一切",
+    "zh": "按中文句号。切", "中文句号": "按中文句号。切", "按中文句号。切": "按中文句号。切",
+    "en": "按英文句号.切", "英文句号": "按英文句号.切", "按英文句号.切": "按英文句号.切",
+    "none": "不切", "不切": "不切",
+}
+
 REPO_MARKERS = ["webui.py", "GPT_SoVITS"]
 
 
@@ -76,7 +88,7 @@ def die(msg):
     raise SystemExit(1)
 
 
-def parse_args():
+def build_parser():
     ap = argparse.ArgumentParser(
         description="GPT-SoVITS 命令行推理（不启动 WebUI）",
     )
@@ -100,7 +112,106 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=-1, help="-1 表示随机；固定它便于复现")
     ap.add_argument("--cpu", action="store_true", help="强制用 CPU（有显卡时才有意义）")
     ap.add_argument("--half", action="store_true", help="强制半精度；CPU 上别加")
-    return ap.parse_args()
+    ap.add_argument("--merge", action="store_true", help="把所有句子拼成一个 wav（段间留 0.25 秒静音）")
+    ap.add_argument("--config", help="ini 配置文件；默认用脚本旁边的 gsv_tts.ini")
+    ap.add_argument("--clip", action="store_true", help="把 Windows 剪贴板里的文字当作要合成的内容（一行一句）")
+    ap.add_argument(
+        "--cut", default="punct",
+        help="长文本怎么切句：punct/标点(默认) | 50字 | 4句 | 中文句号 | 英文句号 | none(不切)",
+    )
+    return ap
+
+
+def parse_args():
+    ap = build_parser()
+    return ap.parse_args(), ap
+
+
+def apply_config(parser, args, path):
+    """把 ini 里的值填进来。优先级：命令行 > ini > 代码默认值。
+
+    只覆盖「命令行上没显式写过」的参数，所以临时想换参考音频照样能加 --ref 覆盖。
+    ini 可以不带 section 头，直接一行一个 key = value；# 开头是注释。
+    key 写命令行参数名即可（ref / ref-text / ref-dir / list / text-file / version ...），
+    内部名（比如 list_path）也认。
+    """
+    if not path or not os.path.exists(path):
+        return None
+    import configparser
+    with open(path, encoding="utf-8-sig") as f:
+        txt = f.read()
+    if "[" not in txt:
+        txt = "[gsv]\n" + txt
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = lambda s: s.strip().lower().replace("-", "_")
+    try:
+        cp.read_string(txt)
+    except Exception as e:
+        die("配置文件读不了: %s\n   %r" % (path, e))
+    sec = cp[cp.sections()[0]]
+
+    # --list 这种参数命令行名字和内部名字不一样（list -> list_path），
+    # 直接用内部名字去查会漏掉，所以这里建一张 命令行名 -> 内部名 的表。
+    opt2dest = {}
+    for act in parser._actions:
+        for s in act.option_strings:
+            opt2dest[s.lstrip("-").replace("-", "_")] = act.dest
+
+    def dest_of(key):
+        return opt2dest.get(key, key)
+
+    provided = set()
+    for tok in sys.argv[1:]:
+        if tok.startswith("--"):
+            n = tok[2:].split("=", 1)[0].replace("-", "_")
+            provided.add(n)
+            provided.add(opt2dest.get(n, n))
+
+    used = []
+    for k, v in sec.items():
+        dest = dest_of(k)
+        if k in provided or dest in provided:
+            continue
+        if not hasattr(args, dest):
+            die(
+                "配置文件里的 %s 不是有效参数。\n   能写的 key：\n     %s"
+                % (k, "  ".join(sorted(opt2dest)))
+            )
+        cur = getattr(args, dest)
+        if isinstance(cur, list):
+            continue
+        try:
+            if isinstance(cur, bool):
+                nv = str(v).strip().lower() in ("1", "true", "yes", "on", "y")
+            elif isinstance(cur, int):
+                nv = int(str(v).strip())
+            elif isinstance(cur, float):
+                nv = float(str(v).strip())
+            else:
+                nv = v
+        except Exception:
+            die("配置文件里 %s = %s 解析不了" % (k, v))
+        setattr(args, dest, nv)
+        used.append(dest)
+    return used
+
+def text_from_clipboard():
+    """读 Windows 剪贴板（复制一段文案直接合成）。"""
+    import subprocess
+    cmd = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard -Raw"
+    for exe in ("powershell", "pwsh"):
+        try:
+            r = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", cmd],
+                capture_output=True, timeout=20,
+            )
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            die("读剪贴板失败: %r" % (e,))
+        if r.returncode == 0:
+            return r.stdout.decode("utf-8-sig", "replace")
+    die("读不到剪贴板：没找到 powershell，或者剪贴板是空的。")
 
 
 def guess_root(script_dir):
@@ -117,6 +228,29 @@ def newest(d, ext):
     return max(fs, key=os.path.getmtime) if fs else None
 
 
+def safe_name(s, n=12):
+    """把一段文本变成能当文件名的短标签（只留字母数字和汉字）"""
+    keep = []
+    for ch in str(s):
+        if ch.isalnum():
+            keep.append(ch)
+        if len(keep) >= n:
+            break
+    return "".join(keep)
+
+
+def merge_segments(segs, gap_sec=0.25):
+    """把 [(sr, wav), ...] 按顺序拼成一段，段间补一点静音，不然听起来会赶"""
+    import numpy as np
+    sr0 = segs[0][0]
+    parts = []
+    for k, (sr, wav) in enumerate(segs):
+        if k:
+            parts.append(np.zeros(int(gap_sec * sr0), dtype=wav.dtype))
+        parts.append(wav)
+    return sr0, np.concatenate(parts)
+
+
 def load_name2text(list_path):
     """output.list 每行是 路径|说话人|语种|文本；官方下游脚本都只取 basename"""
     name2text = {}
@@ -125,7 +259,7 @@ def load_name2text(list_path):
     if not os.path.exists(list_path):
         print("!! 找不到 list 文件: %s（不影响，只是 --ref-text 得手打）" % list_path)
         return name2text
-    with open(list_path, encoding="utf8") as f:
+    with open(list_path, encoding="utf-8-sig") as f:
         for line in f.read().strip("\n").split("\n"):
             part = line.split("|", 3)
             if len(part) == 4:
@@ -153,7 +287,26 @@ def pick_ref(ref_dir, name2text, sf):
 
 
 def main():
-    args = parse_args()
+    args, _parser = parse_args()
+    cfg_path = args.config or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "gsv_tts.ini"
+    )
+    cfg_used = None
+    if os.path.exists(cfg_path):
+        cfg_used = apply_config(_parser, args, cfg_path)
+    elif args.config:
+        die("找不到配置文件: %s" % cfg_path)
+    if args.clip:
+        args.text = list(args.text) + [
+            ln.strip() for ln in text_from_clipboard().splitlines() if ln.strip()
+        ]
+
+    cut_key = CUT_ALIAS.get(str(args.cut).strip().lower()) or CUT_ALIAS.get(str(args.cut).strip())
+    if cut_key is None:
+        die(
+            "--cut 不支持 %r。可选：punct(默认) / 50字 / 4句 / 中文句号 / 英文句号 / none\n"
+            "   一段文本不切句的话，长了容易重复、漏字、变调。" % (args.cut,)
+        )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     root = args.root or os.environ.get("GSV_ROOT") or guess_root(script_dir)
@@ -192,7 +345,7 @@ def main():
     if text_file:
         if not os.path.exists(text_file):
             die("找不到文本文件: %s" % text_file)
-        with open(text_file, encoding="utf8") as f:
+        with open(text_file, encoding="utf-8-sig") as f:
             texts += [ln.strip() for ln in f if ln.strip()]
     if not texts:
         texts = ["今天天气不错，我们一起出去走走吧。"]
@@ -216,6 +369,9 @@ def main():
     print("版本      :", args.version)
     print("GPT 权重  :", gpt)
     print("SoVITS权重:", sovits)
+    print("切句方式  :", cut_key)
+    if cfg_used is not None:
+        print("配置文件  :", cfg_path, "->", ", ".join(cfg_used) or "(没有可用项)")
     print("输出目录  :", out)
     print("=" * 70)
 
@@ -243,16 +399,30 @@ def main():
 
     ref_text = args.ref_text or name2text.get(os.path.basename(ref))
     if not ref_text:
+        if not args.list_path:
+            why = "这次**没有**读到 --list，所以没法按文件名查原文。"
+        elif not name2text:
+            why = "--list 指向的文件没读到任何条目，检查一下路径和文件内容：\n   %s" % list_path
+        else:
+            why = (
+                "--list 读到了 %d 条，但没有任何一行的文件名和它相同。\n"
+                "   list 里前 3 条是：\n     %s"
+                % (len(name2text), "\n     ".join(list(name2text)[:3]))
+            )
         die(
             "拿不到 %s 的原文。用 --ref-text \"那段音频里原封不动说的话\" 手动给，\n"
             "   或者用 --list <output.list> 让它按文件名查。\n"
-            "   注意：参考原文必须和音频逐字一致（标点、数字都要对上），否则会明显跑调。"
-            % os.path.basename(ref)
+            "   注意：参考原文必须和音频逐字一致（标点、数字都要对上），否则会明显跑调。\n\n"
+            "   具体原因：%s" % (os.path.basename(ref), why)
         )
 
     print("参考音频  : %s（%.2f 秒）" % (ref, sf.info(ref).duration))
     print("参考原文  :", ref_text)
     print("待合成    : %d 句" % len(texts))
+    for k, tx in enumerate(texts[:3], 1):
+        print("            %d) %s%s" % (k, tx[:36], "…" if len(tx) > 36 else ""))
+    if len(texts) > 3:
+        print("            …… 后面还有 %d 句" % (len(texts) - 3))
 
     try:
         import GPT_SoVITS.inference_webui as iw
@@ -273,17 +443,27 @@ def main():
 
     prompt_lang = lang_key(args.ref_lang)
     text_lang = lang_key(args.lang)
+    how_to_cut = iw.i18n(cut_key)
 
     t0 = time.time()
     change_gpt_weights(gpt)
     print("[1/3] GPT 权重加载完成 %.1fs" % (time.time() - t0))
 
     t0 = time.time()
-    for _ in change_sovits_weights(sovits):
+    # 官方 change_sovits_weights 有两个坑：
+    #   1) 它是生成器（yield），不迭代就等于完全没加载。
+    #   2) 它末尾那个 yield 会引用 prompt_text_update / text_update /
+    #      visible_sample_steps 等变量，而这些只在
+    #      "prompt_language is not None and text_language is not None" 分支里赋值。
+    #      WebUI 调用时总会带上这两个语种，所以只有命令行调用会踩到
+    #      UnboundLocalError: local variable 'prompt_text_update' referenced before assignment。
+    # 这里照 WebUI 的调法把两个语种一起传进去，两个坑一起躲开。
+    for _ in change_sovits_weights(sovits, prompt_lang, text_lang):
         pass
     print("[2/3] SoVITS 权重加载完成 %.1fs" % (time.time() - t0))
 
     print("[3/3] 开始合成")
+    done = []
     for i, text in enumerate(texts, 1):
         if args.seed is not None and args.seed >= 0:
             iw.set_seed(args.seed)
@@ -300,6 +480,7 @@ def main():
                     top_p=args.top_p,
                     temperature=args.temperature,
                     speed=args.speed,
+                    how_to_cut=how_to_cut,
                 )
             )
         except Exception as e:
@@ -308,14 +489,43 @@ def main():
             traceback.print_exc()
             continue
         sr, wav = results[-1]
-        path = os.path.join(out, "%03d_%d.wav" % (i, int(time.time())))
-        sf.write(path, wav, sr)
-        print("  %d/%d  %.1fs  %.2f 秒音频 -> %s"
-              % (i, len(texts), time.time() - t0, len(wav) / float(sr), path))
+        done.append((sr, wav))
+        secs = len(wav) / float(sr)
+        if args.merge:
+            print("  %d/%d  %.1fs  %.2f 秒" % (i, len(texts), time.time() - t0, secs))
+        else:
+            stem = safe_name(text)
+            fn = ("%03d_%s.wav" % (i, stem)) if stem else ("%03d.wav" % i)
+            path = os.path.join(out, fn)
+            sf.write(path, wav, sr)
+            print("  %d/%d  %.1fs  %.2f 秒音频 -> %s"
+                  % (i, len(texts), time.time() - t0, secs, path))
 
     print("")
-    print("全部结束，产物在:", out)
+    if args.merge:
+        if not done:
+            die("一句都没合成成功，没有可拼接的内容。")
+        sr, wav = merge_segments(done)
+        stem = safe_name(texts[0]) or "all"
+        path = os.path.join(out, "merged_%s.wav" % stem)
+        sf.write(path, wav, sr)
+        print("拼接完成：%d 段 -> %s（共 %.2f 秒）"
+              % (len(done), path, len(wav) / float(sr)))
+    elif len(done) > 1:
+        print("产物是 %d 个片段，都在 %s" % (len(done), out))
+        print("想拼成一个文件：加 --merge，或者在 gsv_tts.ini 里写一行 merge = true")
+    else:
+        print("全部结束，产物在:", out)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
