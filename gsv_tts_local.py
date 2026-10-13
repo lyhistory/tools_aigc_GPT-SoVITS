@@ -99,6 +99,10 @@ def build_parser():
     ap.add_argument("--ref", help="参考音频，3~10 秒干净人声")
     ap.add_argument("--ref-dir", help="参考音频目录；没给 --ref 时自动在这里挑一段 3~10 秒的")
     ap.add_argument("--ref-text", help="参考音频里原封不动说的话（写错会明显跑调）")
+    ap.add_argument(
+        "--ref-trim", nargs=2, type=float, metavar=("START", "END"),
+        help="参考音频不在 3~10 秒时，先剪出第 START~END 秒再用（单位秒，比如 --ref-trim 0 9）",
+    )
     ap.add_argument("--list", dest="list_path", help="output.list；没给 --ref-text 时用它按文件名查原文")
     ap.add_argument("--ref-lang", default="zh", help="参考音频语种，默认 zh")
     ap.add_argument("--lang", default="zh", help="要合成文本的语种，默认 zh")
@@ -268,18 +272,122 @@ def load_name2text(list_path):
     return name2text
 
 
+# soundfile 底层是 libsndfile，它认得这些格式
+SF_EXTS = (".wav", ".flac", ".ogg", ".oga", ".aiff", ".aif", ".au", ".w64", ".caf", ".mp3", ".opus")
+# 参考音频允许出现的格式（不在这两个里的也会试着读一下）
+AUDIO_EXTS = SF_EXTS + (".m4a", ".m4b", ".aac", ".mp4", ".m4v", ".wma", ".amr", ".3gp", ".mov", ".webm", ".mkv")
+
+
+def find_ffmpeg(root):
+    """找 ffmpeg。整合包通常放在 runtime\\，也允许放根目录或直接用 PATH 里的。"""
+    import shutil
+    for c in [
+        os.path.join(root, "ffmpeg.exe"),
+        os.path.join(root, "ffmpeg"),
+        os.path.join(root, "runtime", "ffmpeg.exe"),
+        os.path.join(root, "runtime", "ffmpeg"),
+        os.path.join(root, "runtime", "Library", "bin", "ffmpeg.exe"),
+    ]:
+        if os.path.exists(c):
+            return c
+    for name in ("ffmpeg.exe", "ffmpeg"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def audio_duration(path):
+    """取音频时长。soundfile 读不了 m4a 之类，失败了就退回 torchaudio。"""
+    try:
+        import soundfile as sf
+        return sf.info(path).duration
+    except Exception:
+        pass
+    try:
+        import torchaudio
+        info = torchaudio.info(path)
+        return info.num_frames / float(info.sample_rate)
+    except Exception:
+        return None
+
+
+def norm_trim(v):
+    """把 --ref-trim 的值统一成 (开始秒, 结束秒)。
+
+    命令行写法是 --ref-trim 0 9（argparse 给一个 list），
+    ini 里写 ref-trim = 0 9（configparser 给一个字符串），两种都兼容。
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        import re
+        parts = [p for p in re.split(r"[\s,，]+", v.strip()) if p]
+    else:
+        parts = [str(x) for x in v]
+    if len(parts) != 2:
+        die("ref-trim 要写两个数（开始秒 结束秒），比如 0 9；现在写的是 %r" % (v,))
+    try:
+        a, b = float(parts[0]), float(parts[1])
+    except ValueError:
+        die("ref-trim 的两个值必须是秒数，比如 0 9；现在写的是 %r" % (v,))
+    if a < 0 or b <= a:
+        die("ref-trim 的范围不对：开始 %g、结束 %g（结束要大于开始，且都不能是负数）" % (a, b))
+    return a, b
+
+
+def to_wav(path, root, trim=None):
+    """参考音频必须是 libsndfile 读得了的格式。
+
+    Windows 录音默认就是 m4a，libsndfile 完全不认（报 Format not recognised）。
+    这里用 ffmpeg 转一份 32kHz 单声道 PCM wav 到系统临时目录，原文件不动。
+    传 trim=(开始秒, 结束秒) 时顺便只取这一段（官方只接受 3~10 秒的参考音频）。
+    返回 (真正要用的路径, 是否转换过)。
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if trim is None and ext in SF_EXTS:
+        try:
+            import soundfile as sf
+            sf.info(path)
+            return path, False
+        except Exception:
+            pass
+    ff = find_ffmpeg(root)
+    if not ff:
+        die(
+            "参考音频 %s 的格式 soundfile 读不了（%s 这类需要先转成 wav），\n"
+            "   而这个仓库里也没找到 ffmpeg。检查一下 %s\\runtime\\ffmpeg.exe 在不在，\n"
+            "   或者自己转一份 wav 再用 --ref 指过去。"
+            % (os.path.basename(path), (ext or "?").lstrip("."), root)
+        )
+    import subprocess
+    import tempfile
+    tag = safe_name(os.path.splitext(os.path.basename(path))[0]) or "ref"
+    if trim:
+        tag += "_%g_%g" % trim
+    dst = os.path.join(tempfile.gettempdir(), "gsv_ref_%s.wav" % tag)
+    cmd = [ff, "-y", "-loglevel", "error", "-i", path]
+    if trim:
+        cmd += ["-ss", "%g" % trim[0], "-to", "%g" % trim[1]]
+    cmd += ["-vn", "-ac", "1", "-ar", "32000", "-c:a", "pcm_s16le", dst]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        die("用 ffmpeg 转换参考音频失败：\n   %s\n   %s" % (ff, err or ("退出码 %s" % r.returncode)))
+    return dst, True
+
+
 def pick_ref(ref_dir, name2text, sf):
     """挑一段 3~10 秒的 wav；有对应原文的优先"""
     if not os.path.isdir(ref_dir):
         return None
     cands = []
     for f in sorted(os.listdir(ref_dir)):
-        if not f.lower().endswith(".wav"):
+        if os.path.splitext(f)[1].lower() not in AUDIO_EXTS:
             continue
         p = os.path.join(ref_dir, f)
-        try:
-            dur = sf.info(p).duration
-        except Exception:
+        dur = audio_duration(p)
+        if dur is None:
             continue
         if 3.0 <= dur <= 10.0:
             cands.append((0 if f in name2text else 1, abs(dur - 7.0), p))
@@ -397,7 +505,8 @@ def main():
             "   或者 --ref-dir <切片目录> 让它自己挑一段。"
         )
 
-    ref_text = args.ref_text or name2text.get(os.path.basename(ref))
+    ref_orig = ref
+    ref_text = args.ref_text or name2text.get(os.path.basename(ref_orig))
     if not ref_text:
         if not args.list_path:
             why = "这次**没有**读到 --list，所以没法按文件名查原文。"
@@ -416,7 +525,31 @@ def main():
             "   具体原因：%s" % (os.path.basename(ref), why)
         )
 
-    print("参考音频  : %s（%.2f 秒）" % (ref, sf.info(ref).duration))
+    trim = norm_trim(getattr(args, "ref_trim", None))
+    ref, ref_converted = to_wav(ref_orig, root, trim)
+    if trim:
+        print("[参考音频] 已按 ref-trim 只取第 %g~%g 秒（原文件没动）" % trim)
+    if ref_converted:
+        print("[参考音频] %s 这个格式 soundfile 读不了，已用 ffmpeg 转成 wav（原文件没动）"
+              % os.path.basename(ref_orig))
+    dur = audio_duration(ref)
+    print("参考音频  : %s（%s）" % (ref, ("%.2f 秒" % dur) if dur is not None else "时长未知"))
+    if dur is not None and not (3.0 <= dur <= 10.0):
+        extra = ""
+        if trim is None:
+            extra = (
+                "\n   剪法一（写进 gsv_tts.ini，以后一直生效）：ref-trim = 0 9\n"
+                "   剪法二（只在这次命令行上用）：--ref-trim 0 9\n"
+                "   数字是秒，意思是「取第 0 秒到第 9 秒」，换成你想要的那一段。\n"
+                "   剪完记得把 ref-text 改成这 9 秒里实际说的话（必须逐字一致）。\n"
+                "   更省事的办法（不用自己剪）：\n"
+                "     --ref-dir .\\ref\\training_result\\ --list .\\ref\\training_result\\output.list\n"
+                "   让脚本从训练切片里自动挑一段 3~10 秒的，原文也能自动查出来。"
+            )
+        die(
+            "参考音频是 %.2f 秒，官方硬性要求 3~10 秒，否则合成时会直接报\n"
+            "   「参考音频在3~10秒范围外，请更换！」。%s" % (dur, extra)
+        )
     print("参考原文  :", ref_text)
     print("待合成    : %d 句" % len(texts))
     for k, tx in enumerate(texts[:3], 1):
@@ -520,6 +653,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
